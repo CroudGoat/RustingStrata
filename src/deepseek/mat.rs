@@ -59,6 +59,11 @@ pub(crate) mod dev {
         }).as_ref()
     }
     impl Dev {
+        /// Borrow the activation pair and staging buffer while the device mutex is held.
+        pub(crate) fn scratch(&self) -> (&dyn Backend, &Buf, &Buf, &Buf) {
+            let p = &self.parts[0];
+            (&*p.be, &p.x, &p.y, &p.stage)
+        }
         pub fn bytes(&self) -> usize { self.parts.iter().map(|p| p.bytes).sum() }
         pub fn info(&self) -> (&'static str, usize, usize) { (self.parts[0].be.name(), self.ex.len(), self.bytes()) }
         /// Bytes still available under the expert budget (plain weights already subtracted).

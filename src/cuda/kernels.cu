@@ -1754,6 +1754,47 @@ extern "C" __global__ void ink_clip(float* x, const float* scale, int w, float t
     }
 }
 
+// Four query warps share each 16-row KV tile. Seed the online softmax with the zero-logit, zero-value sink.
+extern "C" __global__ void ink_prefill(const float* q, const float* r, const float* sink, const float* bias,
+    const u16* k, const u16* v, float* out, int nt, int nh, int group, int kh0, int rows, int window, int hd, int nr, int ext) {
+    __shared__ u16 kt[16 * 128], vt[16 * 128];
+    int tid = threadIdx.x, lane = tid & 31, t0 = blockIdx.x * 4, t = t0 + tid / 32;
+    int h = kh0 * group + blockIdx.y, qi = min(t, nt - 1) * nh + h;
+    int base = rows - nt, last = min(rows, base + t0 + 4), end = base + min(t, nt - 1) + 1;
+    int first = max(0, end - window), kh = blockIdx.y / group;
+    float qs[4] = {}, acc[4] = {}, mx = 0.f, z = 1.f, sk = sink[qi], scale = rsqrtf((float)hd);
+    for (int c = lane; c < hd; c += 32) qs[c / 32] = q[qi * hd + c];
+    for (int i = max(0, base + t0 + 1 - window); i < last; i += 16) {
+        int n = min(16, last - i);
+        for (int a = tid; a < n * hd; a += 128) {
+            size_t idx = ((size_t)kh * rows + i) * hd + a;
+            kt[a] = k[idx]; vt[a] = v[idx];
+        }
+        __syncthreads();
+        float scores[16], m = mx;
+        int lo = max(0, first - i), hi = min(n, end - i);
+        for (int j = lo; j < hi; ++j) {
+            float d = 0.f;
+            for (int c = lane; c < hd; c += 32) d += qs[c / 32] * h2f(kt[j * hd + c]);
+            int dist = end - 1 - i - j;
+            d *= scale;
+            if (dist < ext) for (int c = lane; c < nr; c += 32) d += r[qi * nr + c] * bias[c * ext + ext - 1 - dist];
+            scores[j] = warp_sum(d) - sk;
+            m = fmaxf(m, scores[j]);
+        }
+        float re = expf(mx - m);
+        mx = m; z *= re;
+        for (int c = lane; c < hd; c += 32) acc[c / 32] *= re;
+        for (int j = lo; j < hi; ++j) {
+            float p = expf(scores[j] - m);
+            z += p;
+            for (int c = lane; c < hd; c += 32) acc[c / 32] += p * h2f(vt[j * hd + c]);
+        }
+        __syncthreads();
+    }
+    if (t < nt) for (int c = lane; c < hd; c += 32) out[qi * hd + c] = acc[c / 32] / z;
+}
+
 // Attention of one token in two launches. ink_attn: block (head, chunk) of 4 warps takes the 64 rows from chunk * 64;
 // a warp takes one row at a time. Row i of k and v (f16, nkv * hd wide) is at distance (at - i) mod rows. hd divides
 // 128. Writes (max logit, sum of exp, hd sums of exp * v) of each (head, chunk) to sc: nh * chunks * (hd + 2) floats.

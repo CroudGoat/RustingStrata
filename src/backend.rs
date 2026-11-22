@@ -302,6 +302,7 @@ pub trait Backend: Send {
     /// row before it `at - 1` modulo `rows`). Logit: q.k / sqrt(hd) + r.bias[distance] (distance < `ext`) - sink, a
     /// softmax with one more logit of 0, times sigmoid(gate). `hd` divides 128. `sc`: `nh * rows.div_ceil(64) * (hd + 2)`
     /// floats of scratch.
+    fn ink_prefill(&self, _q: u64, _r: u64, _sink: u64, _bias: u64, _k: u64, _v: u64, _out: u64, _nt: usize, _nh: usize, _group: usize, _kh0: usize, _heads: usize, _rows: usize, _window: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling prefill unsupported", self.name()) }
     fn ink_attn(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _rows: usize, _at: usize, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
     /// `acc[c] = cpu[c] + sum over e < ne of wts[e] * d[e * n + c]`.
     fn ink_ffn_sum(&self, _acc: u64, _d: u64, _wts: u64, _ne: usize, _n: usize, _cpu: u64) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }

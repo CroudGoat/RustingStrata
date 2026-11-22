@@ -3,7 +3,7 @@
 //! A slot is one layer run of a token: the core layers run once per pass with the same weights, and every pass keeps
 //! its own attention rows and convolution state.
 //! The prompt runs layer by layer over a chunk of tokens: one GPU GEMM per dense matrix and per routed expert.
-//! ponytail: the attention scores run on the CPU. Move them to the GPU when a long prompt waits on them.
+//! CUDA prefill streams head-major KV through existing scratch; unsupported shapes use the host reference.
 use super::Inkling2Config;
 use crate::deepseek::mat::{Mat, matvec_many, matvec_many_opt, matvec_rows, matvec_rows_many, matvec_rows_sets, situ_chunk, situ_experts};
 use crate::deepseek::ops::{rms_norm, rms_norm_w};
@@ -15,6 +15,7 @@ use half::{f16, slice::HalfFloatSliceExt};
 use rayon::prelude::*;
 
 mod device;
+mod prefill;
 
 /// Epsilon of the norms without a weight (depth mix, loop controllers).
 const MIX_EPS: f32 = 1e-6;
@@ -598,7 +599,19 @@ impl<'a> Inkling2Model<'a> {
         }
         let (scale, group) = (1.0 / (hd as f32).sqrt(), nh / nkv);
         let (keys, vals) = (&slot.k, &slot.v);
-        let mut out = vec![0f32; nt * nh * hd];
+        let gpu = if nt == 1 { None } else {
+            let result = crate::deepseek::mat::dev::get().context("no GPU").and_then(|d| {
+                let d = d.lock().unwrap();
+                prefill::scores(d.scratch(), &qs, &rs, &ys[at[2]..at[3]], &l.rel_bias, slot, nt, nh, hd, nr, cfg.rel_extent, if l.swa { cfg.n_swa } else { base + nt })
+            });
+            if std::env::var_os("STRATA_DS_PROF").is_some() {
+                match &result {
+                    Ok(_) => eprintln!("INK_PREFILL_ATTN path=cuda layer={ip} pos={pos} nt={nt}"),
+                    Err(e) => eprintln!("INK_PREFILL_ATTN path=cpu layer={ip} pos={pos} nt={nt} reason={e:#}"),
+                }
+            }
+            result.ok()
+        };
         // One task per key head: the query heads that share it read its rows once.
         let head = |(i, o): (usize, &mut [f32])| {
             let (t, kh) = (i / nkv, i % nkv);
@@ -629,7 +642,11 @@ impl<'a> Inkling2Model<'a> {
             }
             mix_h(o, &sc, &vals[first * hd..rows * hd], n);
         };
-        out.par_chunks_mut(group * hd).enumerate().for_each(head);
+        let mut out = gpu.unwrap_or_else(|| {
+            let mut out = vec![0f32; nt * nh * hd];
+            out.par_chunks_mut(group * hd).enumerate().for_each(head);
+            out
+        });
         for (t, o) in out.chunks_exact_mut(nh * hd).enumerate() {
             for (o, g) in o.iter_mut().zip(row(3, t)) { *o *= sigmoid(*g); }
         }
@@ -919,7 +936,10 @@ impl<'a> Inkling2Model<'a> {
         for il in 0..cfg.loop_start { cur = self.layer(il, il, cur, &mut blocks, None, pos); }
         // Every pass of the core starts from the prelude output.
         let (prelude, n_pre, core) = (cur.clone(), blocks[0].len(), cfg.loop_end - cfg.loop_start);
+        let profile_pass = nt > 1 && std::env::var_os("STRATA_DS_PROF").is_some();
+        let lookups = || crate::deepseek::mat::EX_LOOKUPS.each_ref().map(|n| n.load(std::sync::atomic::Ordering::Relaxed));
         for pass in 0..cfg.loop_count {
+            let before = profile_pass.then(lookups);
             // The bank of the previous pass, per token: its blocks after the first core block, and its output.
             let bank: Option<Vec<(Vec<Vec<f32>>, Vec<f32>)>> = (pass > 0).then(|| {
                 let outs = std::mem::replace(&mut cur, prelude.clone());
@@ -930,6 +950,10 @@ impl<'a> Inkling2Model<'a> {
                 let query = &self.loops[ip - cfg.loop_start].msg_query;
                 let msgs: Option<Vec<Vec<f32>>> = bank.as_ref().map(|bk| bk.par_iter().map(|(b, out)| mix(b, out, query)).collect());
                 cur = self.layer(il, ip, cur, &mut blocks, msgs.as_deref(), pos);
+            }
+            if let Some([hit, miss]) = before {
+                let [h, m] = lookups();
+                eprintln!("PROF pos {pos}, {nt} tokens: core pass {pass}, expert cache hit {} miss {}", h - hit, m - miss);
             }
         }
         for il in cfg.loop_end..cfg.n_layer { cur = self.layer(il, il, cur, &mut blocks, None, pos); }

@@ -1060,7 +1060,12 @@ fn run(cmd: Cmd) -> anyhow::Result<()> {
     match cmd {
         Cmd::Info { model } => {
             let g = Gguf::open(&model)?;
-            println!("{:#?}", ModelConfig::from_gguf(&g)?);
+            if g.get("general.architecture").ok().and_then(|v| v.as_str()) == Some(rusting_strata::inkling2::ARCH) {
+                let c = rusting_strata::inkling2::Inkling2Config::from_gguf(&g)?;
+                println!("{c:#?}");
+            } else {
+                println!("{:#?}", ModelConfig::from_gguf(&g)?);
+            }
             let mut hist = BTreeMap::<String, usize>::new();
             for t in g.tensors.values() {
                 let name = GgmlType::from_u32(t.ty).map(|ty| ty.name().to_string()).unwrap_or(format!("type{}", t.ty));
